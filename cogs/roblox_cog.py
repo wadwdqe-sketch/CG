@@ -4,6 +4,7 @@ from discord.ext import commands
 import aiohttp
 import os
 import datetime
+import asyncio
 
 ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE", "")
 MAIN_GROUP_ID = os.getenv("ROBLOX_MAIN_GROUP_ID", "")
@@ -21,9 +22,16 @@ MIN_FOLLOWING = 10
 MIN_AGE_DAYS  = 365
 
 
-async def roblox_get(session, url):
-    async with session.get(url, headers=HEADERS) as r:
-        return await r.json()
+async def roblox_get(session, url, *, params=None):
+    """GET a Roblox API endpoint and fail loudly on non-2xx responses."""
+    async with session.get(url, headers=HEADERS, params=params) as r:
+        text = await r.text()
+        if r.status != 200:
+            raise RuntimeError(f"Roblox API returned HTTP {r.status}: {text[:500]}")
+        try:
+            return await r.json(content_type=None)
+        except Exception as exc:
+            raise RuntimeError(f"Roblox API returned invalid JSON: {text[:500]}") from exc
 
 
 async def get_user_by_name(session, username):
@@ -32,22 +40,122 @@ async def get_user_by_name(session, username):
         json={"usernames": [username], "excludeBannedUsers": False},
         headers=HEADERS,
     ) as r:
-        data = await r.json()
+        if r.status != 200:
+            text = await r.text()
+            raise RuntimeError(f"Roblox username API returned HTTP {r.status}: {text[:500]}")
+        data = await r.json(content_type=None)
         return data["data"][0] if data.get("data") else None
 
 
-async def get_badge_count(session, user_id):
-    total, cursor = 0, ""
-    for _ in range(10):
-        url = f"https://badges.roblox.com/v1/users/{user_id}/badges?limit=100&sortOrder=Asc"
+async def get_all_badges(session, user_id):
+    """Retrieve every badge Roblox exposes for the user, following cursors until exhausted."""
+    badges = []
+    cursor = None
+    seen_cursors = set()
+
+    while True:
+        params = {"limit": 100, "sortOrder": "Asc"}
         if cursor:
-            url += f"&cursor={cursor}"
-        data = await roblox_get(session, url)
-        total += len(data.get("data", []))
-        cursor = data.get("nextPageCursor")
-        if not cursor:
+            params["cursor"] = cursor
+
+        data = await roblox_get(
+            session,
+            f"https://badges.roblox.com/v1/users/{user_id}/badges",
+            params=params,
+        )
+        page = data.get("data") or []
+        badges.extend(page)
+
+        next_cursor = data.get("nextPageCursor")
+        if not next_cursor or next_cursor in seen_cursors:
             break
-    return total
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    return badges
+
+
+# These are deliberately conservative heuristics. Roblox does not expose a
+# field saying "fake badge", so the bot cannot objectively determine that.
+OBBY_KEYWORDS = (
+    "obby", "obstacle course", "difficulty chart", "tower obby",
+    "parkour", "mega easy obby", "easy obby", "escape obby",
+)
+
+FREE_BADGE_KEYWORDS = (
+    "free badge", "free", "touch", "walk", "step on", "reset",
+    "respawn", "join", "joined", "welcome", "first badge", "visit",
+    "like this game", "favorite this game", "play the game",
+)
+
+
+def classify_badge(badge):
+    """Return 'obby', 'free', or None using badge/game metadata and text."""
+    universe = badge.get("awardingUniverse") or {}
+    game_name = str(universe.get("name") or "")
+    text = " ".join([
+        str(badge.get("name") or ""),
+        str(badge.get("displayName") or ""),
+        str(badge.get("description") or ""),
+        str(badge.get("displayDescription") or ""),
+        game_name,
+    ]).lower()
+
+    if any(keyword in text for keyword in OBBY_KEYWORDS):
+        return "obby"
+    if any(keyword in text for keyword in FREE_BADGE_KEYWORDS):
+        return "free"
+    return None
+
+
+async def enrich_badges(session, badges):
+    """Fetch missing badge metadata only when needed for classification."""
+    missing = [b for b in badges if not b.get("awardingUniverse")]
+    if not missing:
+        return badges
+
+    # Roblox currently rate-limits cookie-authenticated badge detail requests;
+    # keep this deliberately small rather than firing hundreds at once.
+    sem = asyncio.Semaphore(5)
+
+    async def fetch_detail(badge):
+        async with sem:
+            try:
+                detail = await roblox_get(
+                    session,
+                    f"https://badges.roblox.com/v1/badges/{badge['id']}",
+                )
+                badge.update(detail)
+            except Exception:
+                # The badge still counts toward the total; classification just
+                # falls back to the metadata already returned by the user API.
+                pass
+            await asyncio.sleep(0.05)
+
+    await asyncio.gather(*(fetch_detail(b) for b in missing))
+    return badges
+
+
+async def get_badge_stats(session, user_id):
+    badges = await get_all_badges(session, user_id)
+    await enrich_badges(session, badges)
+
+    obby = 0
+    free = 0
+    for badge in badges:
+        category = classify_badge(badge)
+        if category == "obby":
+            obby += 1
+        elif category == "free":
+            free += 1
+
+    return {
+        "total": len(badges),
+        "obby": obby,
+        "free": free,
+        "fake": obby + free,
+        "non_flagged": max(0, len(badges) - obby - free),
+    }
 
 
 async def get_gamepass_count(session, user_id):
@@ -82,7 +190,17 @@ class RobloxCog(commands.Cog):
         await interaction.response.defer()
 
         async with aiohttp.ClientSession() as session:
-            user_data = await get_user_by_name(session, roblox_user)
+            try:
+                user_data = await get_user_by_name(session, roblox_user)
+            except Exception as exc:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="Background Check — Roblox API Error",
+                        description=f"`{str(exc)[:1500]}`",
+                        color=discord.Color.from_rgb(220, 53, 69),
+                    )
+                )
+                return
             if not user_data:
                 await interaction.followup.send(
                     embed=discord.Embed(
@@ -99,7 +217,21 @@ class RobloxCog(commands.Cog):
             friends    = (await roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/friends/count")).get("count", 0)
             followers  = (await roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/followers/count")).get("count", 0)
             following  = (await roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/followings/count")).get("count", 0)
-            badges     = await get_badge_count(session, user_id)
+            try:
+                badge_stats = await get_badge_stats(session, user_id)
+            except Exception as exc:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="Background Check — Badge API Error",
+                        description=(
+                            "Roblox did not return the complete badge inventory. "
+                            f"\n\n`{str(exc)[:1500]}`"
+                        ),
+                        color=discord.Color.from_rgb(220, 53, 69),
+                    )
+                )
+                return
+            badges = badge_stats["total"]
             gamepasses = await get_gamepass_count(session, user_id)
 
             groups = groups_raw.get("data", [])
@@ -149,7 +281,11 @@ class RobloxCog(commands.Cog):
             embed.add_field(
                 name="Statistics",
                 value="\n".join([
-                    f"Badges: **{badges}**",
+                    f"Total Badges: **{badges}**",
+                    f"Fake/Low-effort Badges: **{badge_stats["fake"]}**",
+                    f"  • Obby Badges: **{badge_stats["obby"]}**",
+                    f"  • Free/Trivial Badges: **{badge_stats["free"]}**",
+                    f"Non-flagged Badges: **{badge_stats["non_flagged"]}**",
                     f"Friends: **{friends}**",
                     f"Followers: **{followers}**",
                     f"Following: **{following}**",
