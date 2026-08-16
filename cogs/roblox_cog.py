@@ -109,30 +109,12 @@ def classify_badge(badge):
 
 
 async def enrich_badges(session, badges):
-    """Fetch missing badge metadata only when needed for classification."""
-    missing = [b for b in badges if not b.get("awardingUniverse")]
-    if not missing:
-        return badges
+    """Keep badge classification fast by using metadata returned by the list endpoint.
 
-    # Roblox currently rate-limits cookie-authenticated badge detail requests;
-    # keep this deliberately small rather than firing hundreds at once.
-    sem = asyncio.Semaphore(5)
-
-    async def fetch_detail(badge):
-        async with sem:
-            try:
-                detail = await roblox_get(
-                    session,
-                    f"https://badges.roblox.com/v1/badges/{badge['id']}",
-                )
-                badge.update(detail)
-            except Exception:
-                # The badge still counts toward the total; classification just
-                # falls back to the metadata already returned by the user API.
-                pass
-            await asyncio.sleep(0.05)
-
-    await asyncio.gather(*(fetch_detail(b) for b in missing))
+    The user-badge endpoint normally includes the awarding universe metadata.
+    Fetching an individual detail endpoint for every badge is extremely slow
+    and can trigger Roblox rate limits, so missing metadata is left unclassified.
+    """
     return badges
 
 
@@ -159,16 +141,27 @@ async def get_badge_stats(session, user_id):
 
 
 async def get_gamepass_count(session, user_id):
-    total, cursor = 0, ""
-    for _ in range(20):
-        url = f"https://inventory.roblox.com/v1/users/{user_id}/assets/gamepasses?limit=100"
+    total, cursor = 0, None
+    seen_cursors = set()
+
+    while True:
+        params = {"limit": 100}
         if cursor:
-            url += f"&cursor={cursor}"
-        data = await roblox_get(session, url)
+            params["cursor"] = cursor
+
+        data = await roblox_get(
+            session,
+            f"https://inventory.roblox.com/v1/users/{user_id}/assets/gamepasses",
+            params=params,
+        )
         total += len(data.get("data", []))
-        cursor = data.get("nextPageCursor")
-        if not cursor:
+
+        next_cursor = data.get("nextPageCursor")
+        if not next_cursor or next_cursor in seen_cursors:
             break
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
     return total
 
 
@@ -212,27 +205,33 @@ class RobloxCog(commands.Cog):
                 return
 
             user_id = user_data["id"]
-            info       = await roblox_get(session, f"https://users.roblox.com/v1/users/{user_id}")
-            groups_raw = await roblox_get(session, f"https://groups.roblox.com/v1/users/{user_id}/groups/roles")
-            friends    = (await roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/friends/count")).get("count", 0)
-            followers  = (await roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/followers/count")).get("count", 0)
-            following  = (await roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/followings/count")).get("count", 0)
+
+            # These requests are independent, so run them concurrently instead
+            # of waiting for each Roblox endpoint one-by-one.
             try:
-                badge_stats = await get_badge_stats(session, user_id)
+                info, groups_raw, friends_raw, followers_raw, following_raw, badge_stats, gamepasses = await asyncio.gather(
+                    roblox_get(session, f"https://users.roblox.com/v1/users/{user_id}"),
+                    roblox_get(session, f"https://groups.roblox.com/v1/users/{user_id}/groups/roles"),
+                    roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/friends/count"),
+                    roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/followers/count"),
+                    roblox_get(session, f"https://friends.roblox.com/v1/users/{user_id}/followings/count"),
+                    get_badge_stats(session, user_id),
+                    get_gamepass_count(session, user_id),
+                )
             except Exception as exc:
                 await interaction.followup.send(
                     embed=discord.Embed(
-                        title="Background Check — Badge API Error",
-                        description=(
-                            "Roblox did not return the complete badge inventory. "
-                            f"\n\n`{str(exc)[:1500]}`"
-                        ),
+                        title="Background Check — Roblox API Error",
+                        description=f"`{str(exc)[:1500]}`",
                         color=discord.Color.from_rgb(220, 53, 69),
                     )
                 )
                 return
+
+            friends = friends_raw.get("count", 0)
+            followers = followers_raw.get("count", 0)
+            following = following_raw.get("count", 0)
             badges = badge_stats["total"]
-            gamepasses = await get_gamepass_count(session, user_id)
 
             groups = groups_raw.get("data", [])
             user_group_map = {str(g["group"]["id"]): g for g in groups}
@@ -282,10 +281,10 @@ class RobloxCog(commands.Cog):
                 name="Statistics",
                 value="\n".join([
                     f"Total Badges: **{badges}**",
-                    f"Fake/Low-effort Badges: **{badge_stats["fake"]}**",
-                    f"  • Obby Badges: **{badge_stats["obby"]}**",
-                    f"  • Free/Trivial Badges: **{badge_stats["free"]}**",
-                    f"Non-flagged Badges: **{badge_stats["non_flagged"]}**",
+                    f"Fake/Low-effort Badges: **{badge_stats['fake']}**",
+                    f"  • Obby Badges: **{badge_stats['obby']}**",
+                    f"  • Free/Trivial Badges: **{badge_stats['free']}**",
+                    f"Non-flagged Badges: **{badge_stats['non_flagged']}**",
                     f"Friends: **{friends}**",
                     f"Followers: **{followers}**",
                     f"Following: **{following}**",
